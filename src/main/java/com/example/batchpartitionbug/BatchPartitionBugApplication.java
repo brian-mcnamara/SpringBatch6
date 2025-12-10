@@ -6,8 +6,10 @@ import org.springframework.batch.core.configuration.annotation.EnableBatchProces
 import org.springframework.batch.core.configuration.support.JdbcDefaultBatchConfiguration;
 import org.springframework.batch.core.job.Job;
 import org.springframework.batch.core.job.JobExecution;
+import org.springframework.batch.core.job.JobInstance;
 import org.springframework.batch.core.job.builder.JobBuilder;
 import org.springframework.batch.core.job.parameters.JobParameters;
+import org.springframework.batch.core.job.parameters.JobParametersBuilder;
 import org.springframework.batch.core.launch.JobOperator;
 import org.springframework.batch.core.partition.PartitionHandler;
 import org.springframework.batch.core.partition.Partitioner;
@@ -43,7 +45,11 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.scheduling.support.PeriodicTrigger;
 
 import javax.sql.DataSource;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 
 @Configuration
@@ -52,26 +58,73 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Import(JdbcDefaultBatchConfiguration.class)
 public class BatchPartitionBugApplication {
 
+    private static final CountDownLatch countDownLatch = new CountDownLatch(1);
+
     public static void main(String[] args) {
         ApplicationContext context = new AnnotationConfigApplicationContext(BatchPartitionBugApplication.class);
         JobOperator jobOperator = context.getBean(JobOperator.class);
         Job job = context.getBean("controllerJob", Job.class);
-        JobParameters jobParameters = new JobParameters();
+        JobParameters jobParameters = new JobParametersBuilder().addString("uuid", UUID.randomUUID().toString()).toJobParameters();
         try {
-            JobExecution jobExecution = jobOperator.start(job, jobParameters);
+            // Start the job
+            Executors.newSingleThreadExecutor().submit(() -> {
+                try {
+                    jobOperator.start(job, jobParameters);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
             JobRepository jobRepository = context.getBean(JobRepository.class);
+            JobInstance jobInstance;
+
+            // Wait for launch
             while (true) {
-                JobExecution execution = jobRepository.getJobExecution(jobExecution.getId());
-                if (execution.getStatus().isGreaterThan(BatchStatus.STARTED)) {
+                jobInstance = jobRepository.getJobInstance(job.getName(), jobParameters);
+                if (jobInstance == null) {
+                    continue;
+                }
+                List<JobExecution> execution = jobRepository.getJobExecutions(jobInstance);
+                if (execution.size() == 1 && execution.getFirst().getStatus().equals(BatchStatus.STARTED)) {
                     break;
                 }
-                Thread.sleep(100);
             }
-            JobExecution execution = jobRepository.getJobExecution(jobExecution.getId());
+            // Controller is shutdown, workers continue
+            jobOperator.stop(jobRepository.getLastJobExecution(jobInstance));
 
-            if (!execution.getFailureExceptions().isEmpty()) {
-                System.err.println("BUG: context not persisted");
-                execution.getFailureExceptions().forEach(it -> it.printStackTrace());
+            // Wait for controller to stop
+            while (true) {
+                JobExecution execution = jobRepository.getLastJobExecution(jobInstance);
+                if (execution.getStatus().equals(BatchStatus.STOPPED)) {
+                    break;
+                }
+            }
+
+            //Unlock workers
+            countDownLatch.countDown();
+
+            // Wait for workers to complete
+            while (true) {
+                JobExecution execution = jobRepository.getLastJobExecution(jobInstance);
+                if (execution.getStepExecutions().stream().filter(stepExecution -> stepExecution.getStatus() == BatchStatus.COMPLETED).count() == 2) {
+                    break;
+                }
+            }
+
+            // Restart the controller job
+            jobOperator.restart(jobRepository.getLastJobExecution(jobInstance));
+
+            // Wait for the controller to complete
+            while (true) {
+                JobExecution execution = jobRepository.getLastJobExecution(jobInstance);
+                if (execution.getStatus().equals(BatchStatus.FAILED) || execution.getStatus().equals(BatchStatus.COMPLETED)) {
+                    break;
+                }
+            }
+
+            // Bug: Controller should complete successfully, but completed executions are filtered out and the aggregator is not passed the completed values
+            JobExecution execution = jobRepository.getLastJobExecution(jobInstance);
+            if (execution.getStatus().equals(BatchStatus.FAILED)) {
+                System.err.println("BUG: Aggregator does not contain completed worker steps");
                 System.exit(1);
             }
         } catch (Exception e) {
@@ -79,18 +132,14 @@ public class BatchPartitionBugApplication {
         }
     }
 
-    private static final String CONTEXT_KEY = "testKey";
-
     @Bean("workerTasklet")
     public Tasklet workerTasklet() {
         return new Tasklet() {
 
             @Override
             public @Nullable RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
-                // Bug is demonstrated here
-                if (contribution.getStepExecution().getExecutionContext().get(CONTEXT_KEY) == null) {
-                    throw new Exception("BUG: context key is null");
-                }
+                //Artificial delay for representing delay
+                countDownLatch.await();
                 return RepeatStatus.FINISHED;
             }
         };
@@ -181,6 +230,12 @@ public class BatchPartitionBugApplication {
                 .start(new StepBuilder("partitioner", jobRepository)
                         .partitioner("partitioner", partitioner())
                         .partitionHandler(partitionHandler())
+                        .aggregator((result, executions) -> {
+                            // Should contain the two workers
+                            if (executions.isEmpty()) {
+                                throw new RuntimeException("BUG: Completed aggregator does not contain all executions");
+                            }
+                        })
                         .build())
                 .build();
     }
@@ -197,8 +252,8 @@ public class BatchPartitionBugApplication {
         return new Partitioner() {
             @Override
             public Map<String, ExecutionContext> partition(int gridSize) {
-                return Map.of("1", new ExecutionContext(Map.of(CONTEXT_KEY, 1)),
-                        "2", new ExecutionContext(Map.of(CONTEXT_KEY, 2)));
+                return Map.of("1", new ExecutionContext(),
+                        "2", new ExecutionContext());
             }
         };
     }
